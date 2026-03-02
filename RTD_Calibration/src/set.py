@@ -1,4 +1,4 @@
-"""
+""" HAY QUE CAMBIAR EL FILTRO DE SIGMAS PARA EVITAR ERROR EN SET 57 
 Clase Set - Agrupa múltiples runs del mismo set de calibración.
 
 Responsabilidades:
@@ -324,3 +324,180 @@ class Set:
             })
         
         return pd.DataFrame(summary)
+    
+    def calculate_repeatability_histograms(self, selected_sets=None):
+        """
+        Calcula histogramas de sigmas de repetibilidad por ronda.
+        
+        Para cada sensor en un set, calcula la desviación estándar (sigma) del offset 
+        entre ese sensor y el sensor de referencia del set, usando los 4 runs.
+        
+        Args:
+            selected_sets: Lista de sets a procesar (None = todos)
+            
+        Returns:
+            Tupla (all_data, filtered_data) donde:
+            - all_data: Dict con todos los sensores {set_num: {'sensor_id': sigma_value, ...}}
+            - filtered_data: Dict sin sensores descartados {set_num: {'sensor_id': sigma_value, ...}}
+        """
+        print("\n=== Calculando histogramas de repetibilidad por ronda ===")
+        
+        sets_to_process = selected_sets if selected_sets else list(self.runs_by_set.keys())
+        repeatability_data_all = {}
+        repeatability_data_filtered = {}
+        
+        for set_num in sets_to_process:
+            if set_num not in self.runs_by_set:
+                print(f"Advertencia: Set {set_num} no tiene runs cargados")
+                continue
+            
+            print(f"\nSet {set_num}:")
+            runs = self.runs_by_set[set_num]
+            
+            # Obtener configuración del set
+            # NOTA: reference_sensors se usa SOLO para excluir esos sensores del output filtrado.
+            # La referencia matemática es siempre el 2do sensor del mapping (ref=2), NO el config.
+            set_config = self.config.get('sensors', {}).get('sets', {}).get(set_num, {})
+            reference_sensors = set_config.get('reference', [])
+            discarded_sensors = set_config.get('discarded', [])
+            discarded_sensors_str = [str(s) for s in discarded_sensors]
+            refs_str = [str(r) for r in reference_sensors]  # solo para excluir del output
+
+            # --- PASO 1: Cargar todos los offsets de todos los runs ---
+            all_run_offsets = {}
+            for filename, run in runs.items():
+                try:
+                    offsets, _ = run.calculate_offsets()
+                    all_run_offsets[filename] = offsets
+                except Exception as e:
+                    print(f"  ✗ Error cargando {filename}: {e}")
+
+            if not all_run_offsets:
+                print(f"  Sin datos válidos para set {set_num}")
+                continue
+
+            # --- PASO 2: Asignar referencia matemática por sensor ---
+            # Igual que proyecto bueno: ref=2 (2do sensor del mapping) salvo si hay raised sensors.
+            # refs_str se definió arriba y es SOLO para excluir del output.
+            raised_sensors = set_config.get('raised', [])
+            raised_str = [str(r) for r in raised_sensors]
+            
+            # Construir mapping de sensor_id -> posición de canal
+            example_run = next(iter(all_run_offsets.values()))
+            sensor_to_channel = {}
+            channel_to_sensor = {}
+            
+            for idx, sid in enumerate(example_run.index):
+                sensor_to_channel[str(sid)] = idx
+                channel_to_sensor[idx] = str(sid)
+            
+            # Determinar referencia por sensor (igual que proyecto bueno)
+            ref_por_sensor = {}
+            
+            if len(raised_str) >= 2:
+                # Caso 1: Hay 2+ sensores raised → usar referencias dinámicas
+                raised_channels = [sensor_to_channel.get(r) for r in raised_str if sensor_to_channel.get(r) is not None][:2]
+                
+                for sid in sensor_to_channel.keys():
+                    ch = sensor_to_channel[sid]
+                    if sid in raised_str:
+                        # Si el sensor es raised, usa el otro raised como ref
+                        other_raised = [channel_to_sensor[rc] for rc in raised_channels if channel_to_sensor[rc] != sid]
+                        ref_por_sensor[sid] = other_raised[0] if other_raised else raised_str[0]
+                    else:
+                        # Sensor normal: usa el raised más cercano circularmente
+                        distances = [
+                            min(abs(ch - rc), 12 - abs(ch - rc))
+                            for rc in raised_channels
+                        ]
+                        closest_idx = np.argmin(distances)
+                        ref_por_sensor[sid] = channel_to_sensor[raised_channels[closest_idx]]
+                
+                print(f"  ℹ️  Referencias dinámicas: sensores raised {raised_str[:2]}")
+            else:
+                # Caso 2: Menos de 2 raised → usar canal fijo (igual que proyecto bueno con ref=2)
+                # El proyecto bueno usa el segundo sensor del mapping como referencia fija
+                ref_idx = 1  # Índice 1 = segundo sensor (ref=2 en base-1)
+                fixed_ref = channel_to_sensor.get(ref_idx)
+                
+                if fixed_ref:
+                    # Todos los sensores usan el segundo sensor del mapping como referencia
+                    for sid in sensor_to_channel.keys():
+                        ref_por_sensor[sid] = fixed_ref
+                    print(f"  ℹ️  Usando canal fijo (ref=2): sensor {fixed_ref}")
+
+            # --- PASO 3: Calcular sigma como std de MEDIAS POR RUN (igual que proyecto bueno) ---
+            # Usa la referencia específica asignada a cada sensor (referencias dinámicas)
+            sigma_by_sensor_all = {}
+            sigma_by_sensor_filtered = {}
+            
+            # Construir lista de sensores
+            all_sensors = set(sensor_to_channel.keys())
+            
+            for sensor_id in all_sensors:
+                # Referencia específica para este sensor (siempre del mapping, nunca del config)
+                ref_sensor = ref_por_sensor.get(sensor_id)
+                
+                # Calcular la media de offset por run
+                run_means = []
+                for filename, offsets in all_run_offsets.items():
+                    if ref_sensor is None or ref_sensor not in offsets.columns or sensor_id not in offsets.index:
+                        continue
+                    val = offsets.loc[sensor_id, ref_sensor]
+                    if np.isfinite(float(val)):
+                        run_means.append(float(val))
+                
+                if len(run_means) < 2:
+                    sigma_by_sensor_all[str(sensor_id)] = np.nan
+                    if str(sensor_id) not in discarded_sensors_str and str(sensor_id) not in refs_str:
+                        sigma_by_sensor_filtered[str(sensor_id)] = np.nan
+                    continue
+                
+                run_means_arr = np.array(run_means)
+                
+                # Filtro IQR sobre las medias por run (igual que proyecto bueno)
+                if len(run_means_arr) >= 4:
+                    q1 = np.percentile(run_means_arr, 25)
+                    q3 = np.percentile(run_means_arr, 75)
+                    iqr = q3 - q1
+                    lower_bound = q1 - 3 * iqr
+                    upper_bound = q3 + 3 * iqr
+                    filtered_means = run_means_arr[(run_means_arr >= lower_bound) & (run_means_arr <= upper_bound)]
+                    n_filtered = len(run_means_arr) - len(filtered_means)
+                    if n_filtered > 0:
+                        print(f"  ⚠️  Sensor {sensor_id}: {n_filtered} run(s) filtrado(s) por IQR "
+                              f"[{lower_bound*1000:.2f}, {upper_bound*1000:.2f}] mK")
+                    if len(filtered_means) >= 2:
+                        sigma = np.std(filtered_means, ddof=1)
+                    elif len(filtered_means) == 1:
+                        sigma = np.nan
+                    else:
+                        sigma = np.std(run_means_arr, ddof=1)
+                else:
+                    sigma = np.std(run_means_arr, ddof=1)
+                
+                sigma_by_sensor_all[str(sensor_id)] = sigma
+                
+                # filtered: excluir sensores de referencia y descartados
+                if str(sensor_id) not in discarded_sensors_str and str(sensor_id) not in refs_str:
+                    sigma_by_sensor_filtered[str(sensor_id)] = sigma
+            
+            repeatability_data_all[set_num] = sigma_by_sensor_all
+            repeatability_data_filtered[set_num] = sigma_by_sensor_filtered
+            
+            # Estadísticas del set
+            valid_sigmas_all = [s for s in sigma_by_sensor_all.values() if np.isfinite(s)]
+            valid_sigmas_filtered = [s for s in sigma_by_sensor_filtered.values() if np.isfinite(s)]
+            
+            if valid_sigmas_all:
+                print(f"  Sensor de referencia: {ref_sensor}")
+                print(f"  Sensores descartados: {discarded_sensors}")
+                print(f"  Total sensores procesados: {len(sigma_by_sensor_all)}")
+                print(f"  Sigmas válidas (todos): {len(valid_sigmas_all)}")
+                print(f"  Sigmas válidas (sin descartados): {len(valid_sigmas_filtered)}")
+                print(f"  Sigma media (todos): {np.mean(valid_sigmas_all)*1000:.3f} mK")
+                print(f"  Sigma media (sin descartados): {np.mean(valid_sigmas_filtered)*1000:.3f} mK")
+                print(f"  Sigma máxima (todos): {np.max(valid_sigmas_all)*1000:.3f} mK")
+        
+        print(f"\nTotal sets procesados: {len(repeatability_data_all)}")
+        return repeatability_data_all, repeatability_data_filtered

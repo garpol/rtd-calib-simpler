@@ -885,24 +885,72 @@ class Tree:
                         results_main.append(self._create_result_record(sensor, set_id, 1))
                         continue
                     
-                    # Calcular cadena para ref_raised
-                    offset_chain, error_chain, steps = self._calculate_chained_offset_r1(
-                        ref_raised, set_id, set_raised, reference_sensor, reference_set,
-                        return_steps=True
-                    )
+                    # Para raised sensors, calculamos la cadena DESDE ref_raised pero empezando en R2
+                    # (no necesitamos Paso1 dentro del mismo set R1 porque ya hicimos Paso0)
                     
-                    if offset_chain is None:
+                    # Encontrar ref_raised en R2
+                    set_r2 = None
+                    sets_config = self.config.get('sensors', {}).get('sets', {})
+                    r2_sets = self.sets_by_round.get(2, [])
+                    for r2_id in r2_sets:
+                        r2_config = sets_config.get(float(r2_id), {})
+                        if ref_raised in r2_config.get('sensors', []):
+                            set_r2 = r2_id
+                            break
+                    
+                    if set_r2 is None:
+                        print(f"  ✗ Sensor {sensor} (raised): ref_raised {ref_raised} no está en ningún Set R2")
                         results_main.append(self._create_result_record(sensor, set_id, 1))
                         continue
                     
-                    # Total: offset_0 + cadena
-                    total_offset = offset_0 + offset_chain
-                    total_error = propagate_error(error_0, error_chain)
+                    # Encontrar bridge de R2 a R3
+                    r2_raised = sets_config.get(float(set_r2), {}).get('raised', [])
+                    r3_sensors = sets_config.get(float(reference_set), {}).get('sensors', [])
+                    bridge_r2_r3 = None
+                    for r2_r in r2_raised:
+                        if r2_r in r3_sensors:
+                            bridge_r2_r3 = r2_r
+                            break
+                    
+                    if bridge_r2_r3 is None:
+                        print(f"  ✗ Sensor {sensor} (raised): Set R2 {set_r2} no tiene bridge a R3")
+                        results_main.append(self._create_result_record(sensor, set_id, 1))
+                        continue
+                    
+                    # Paso 1 (R2): ref_raised → bridge_r2_r3 en Set R2
+                    if ref_raised == bridge_r2_r3:
+                        offset_1 = 0.0
+                        error_1 = 0.0
+                    else:
+                        offset_1, error_1 = self.get_offset_within_set(set_r2, ref_raised, bridge_r2_r3)
+                        if offset_1 is None or pd.isna(offset_1):
+                            print(f"  ✗ Sensor {sensor} (raised): {ref_raised}→{bridge_r2_r3} en Set{set_r2} = None/NaN")
+                            results_main.append(self._create_result_record(sensor, set_id, 1))
+                            continue
+                        if error_1 is None or pd.isna(error_1):
+                            error_1 = 0.0
+                    
+                    # Paso 2 (R3): bridge_r2_r3 → reference_sensor en Set R3
+                    if bridge_r2_r3 == reference_sensor:
+                        offset_2 = 0.0
+                        error_2 = 0.0
+                    else:
+                        offset_2, error_2 = self.get_offset_within_set(reference_set, bridge_r2_r3, reference_sensor)
+                        if offset_2 is None or pd.isna(offset_2):
+                            print(f"  ✗ Sensor {sensor} (raised): {bridge_r2_r3}→{reference_sensor} en Set{reference_set} = None/NaN")
+                            results_main.append(self._create_result_record(sensor, set_id, 1))
+                            continue
+                        if error_2 is None or pd.isna(error_2):
+                            error_2 = 0.0
+                    
+                    # Total: offset_0 + offset_1 + offset_2
+                    total_offset = offset_0 + offset_1 + offset_2
+                    total_error = propagate_error(error_0, error_1, error_2)
                     
                     results_main.append(self._create_result_record(sensor, set_id, 1, 
                                                                    total_offset, total_error, 'Calculado'))
                     
-                    # Guardar pasos: Paso0 (sensor→otro_raised) + Pasos1-3 (de la cadena)
+                    # Guardar pasos simplificados (sin loop back)
                     steps_row = {
                         'Sensor': sensor,
                         'Set': set_id,
@@ -913,10 +961,23 @@ class Tree:
                         'Paso0_Sensor_to': ref_raised,
                         'Paso0_Set': set_id,
                         'Paso0_Offset_K': offset_0,
-                        'Paso0_Error_K': error_0
+                        'Paso0_Error_K': error_0,
+                        'Paso1_Sensor_from': ref_raised,
+                        'Paso1_Sensor_to': bridge_r2_r3,
+                        'Paso1_Set': set_r2,
+                        'Paso1_Offset_K': offset_1,
+                        'Paso1_Error_K': error_1,
+                        'Paso2_Sensor_from': bridge_r2_r3,
+                        'Paso2_Sensor_to': reference_sensor,
+                        'Paso2_Set': reference_set,
+                        'Paso2_Offset_K': offset_2,
+                        'Paso2_Error_K': error_2,
+                        'Paso3_Sensor_from': None,
+                        'Paso3_Sensor_to': None,
+                        'Paso3_Set': None,
+                        'Paso3_Offset_K': None,
+                        'Paso3_Error_K': None
                     }
-                    # Añadir los pasos de la cadena (que vienen con nombres Paso1_, Paso2_, Paso3_)
-                    steps_row.update(steps)
                     results_steps.append(steps_row)
                     continue
                 
@@ -1164,10 +1225,12 @@ class Tree:
                     min_offset, min_error = all_paths[min_idx][0], all_paths[min_idx][1]
                     
                     # Estrategia 3: Media ponderada
-                    weights = 1.0 / (errors**2 + 1e-10)
-                    weights /= weights.sum()
-                    weighted_offset = np.sum(offsets * weights)
-                    weighted_error = np.sqrt(np.sum((errors * weights)**2))
+                    # Pesos: w_i = 1/σ_i²
+                    weights_unnorm = 1.0 / (errors**2 + 1e-10)
+                    # Media ponderada: μ = Σ(x_i × w_i) / Σ(w_i)
+                    weighted_offset = np.sum(offsets * weights_unnorm) / np.sum(weights_unnorm)
+                    # Error de la media ponderada: σ = 1/√(Σ(w_i)) = 1/√(Σ(1/σ_i²))
+                    weighted_error = 1.0 / np.sqrt(np.sum(weights_unnorm))
                     
                     results.append(self._create_multipath_result_record(
                         sensor, set_id, len(all_paths),
@@ -1204,13 +1267,12 @@ class Tree:
                 min_error = errors[idx_min]
                 
                 # 3. Media ponderada por 1/error²
-                # Usar pesos inversamente proporcionales al error al cuadrado
-                weights = 1.0 / (errors**2 + 1e-10)  # +epsilon para evitar división por cero
-                weights = weights / weights.sum()  # Normalizar
-                
-                weighted_offset = np.sum(offsets * weights)
-                # Error de la media ponderada (propagación)
-                weighted_error = np.sqrt(np.sum((errors * weights)**2))
+                # Pesos: w_i = 1/σ_i²
+                weights_unnorm = 1.0 / (errors**2 + 1e-10)  # +epsilon para evitar división por cero
+                # Media ponderada: μ = Σ(x_i × w_i) / Σ(w_i)
+                weighted_offset = np.sum(offsets * weights_unnorm) / np.sum(weights_unnorm)
+                # Error de la media ponderada: σ = 1/√(Σ(w_i)) = 1/√(Σ(1/σ_i²))
+                weighted_error = 1.0 / np.sqrt(np.sum(weights_unnorm))
                 
                 # Estadísticas de variabilidad
                 std_between_paths = np.std(offsets)
@@ -1339,3 +1401,183 @@ class Tree:
                     print()
         
         print("="*70)
+    
+    def export_all_paths_details(self, reference_set: Optional[float] = None,
+                                  r1_sets_range: Optional[tuple] = None) -> pd.DataFrame:
+        """
+        Exporta TODOS los caminos individuales para cada sensor (similar a calibration_details_tree.csv).
+        
+        Cada fila representa UN camino completo con sus pasos intermedios.
+        Un sensor con N caminos posibles tendrá N filas en el CSV.
+        
+        Args:
+            reference_set: ID del set de referencia R3
+            r1_sets_range: Tupla (min, max) para limitar sets R1
+        
+        Returns:
+            DataFrame con todos los caminos individuales detallados
+        """
+        if reference_set is None:
+            reference_set = self._get_reference_set()
+        
+        print("\n=== EXPORTANDO TODOS LOS CAMINOS INDIVIDUALES ===")
+        
+        # Determinar sets R1
+        r1_sets = self._determine_r1_sets(reference_set, r1_sets_range)
+        
+        # Obtener referencia
+        reference_sensor, _ = self._get_reference_info(reference_set)
+        if reference_sensor is None:
+            return pd.DataFrame()
+        
+        print(f"Referencia absoluta: Sensor {reference_sensor} (Set {reference_set})")
+        print(f"Procesando {len(r1_sets)} sets de Ronda 1\n")
+        
+        all_paths_records = []
+        
+        for set_id in sorted(r1_sets):
+            sets_config = self.config.get('sensors', {}).get('sets', {})
+            set_config = sets_config.get(float(set_id), {})
+            set_sensors = set_config.get('sensors', [])
+            set_raised = set_config.get('raised', [])
+            set_discarded = set_config.get('discarded', [])
+            
+            if not set_raised:
+                continue
+            
+            for sensor in set_sensors:
+                if sensor in set_discarded:
+                    continue
+                
+                # Caso especial: sensores raised
+                if sensor in set_raised:
+                    other_raised = [r for r in set_raised if r != sensor]
+                    if not other_raised:
+                        continue
+                    
+                    ref_raised = other_raised[0]
+                    offset_0, error_0 = self.get_offset_within_set(set_id, sensor, ref_raised)
+                    
+                    if offset_0 is None:
+                        continue
+                    
+                    if error_0 is None:
+                        error_0 = 0.0
+                    
+                    # Explorar caminos para ref_raised
+                    paths_ref = self._explore_all_paths(
+                        ref_raised, set_id, set_raised, reference_sensor, reference_set
+                    )
+                    
+                    if not paths_ref:
+                        continue
+                    
+                    # Aplicar offset_0 a todos los caminos
+                    for path_idx, (offset_ref, error_ref, path_info) in enumerate(paths_ref, 1):
+                        total_offset = offset_0 + offset_ref
+                        total_error = propagate_error(error_0, error_ref)
+                        
+                        # Reconstruir TODOS los pasos desde path_info
+                        # path_info contiene el camino COMPLETO desde ref_raised:
+                        #   offset_1: ref_raised → raised_r1 (dentro de R2)
+                        #   offset_2: raised_r1 → bridge_r2_r3 (dentro de R2)  
+                        #   offset_3: bridge_r2_r3 → reference (en R3)
+                        
+                        all_paths_records.append({
+                            'Sensor': sensor,
+                            'Set': set_id,
+                            'Round': 1,
+                            'Path_Number': path_idx,
+                            
+                            # Paso 0: sensor_raised → otro_raised (dentro del mismo set R1)
+                            'Paso0_From': sensor,
+                            'Paso0_To': ref_raised,
+                            'Paso0_Set': set_id,
+                            'Paso0_Offset_K': offset_0,
+                            'Paso0_Error_K': error_0,
+                            
+                            # Paso 1: ref_raised → raised_r1 (en R2)
+                            'Paso1_From': ref_raised,
+                            'Paso1_To': path_info['raised_r1'],
+                            'Paso1_Set': path_info['set_r2'],
+                            'Paso1_Offset_K': path_info['offset_1'],
+                            'Paso1_Error_K': path_info['error_1'],
+                            
+                            # Paso 2: raised_r1 → bridge_r2_r3 (en R2)
+                            'Paso2_From': path_info['raised_r1'],
+                            'Paso2_To': path_info['bridge_r2_r3'],
+                            'Paso2_Set': path_info['set_r2'],
+                            'Paso2_Offset_K': path_info['offset_2'],
+                            'Paso2_Error_K': path_info['error_2'],
+                            
+                            # Paso 3: bridge_r2_r3 → reference (en R3)
+                            'Paso3_From': path_info['bridge_r2_r3'],
+                            'Paso3_To': reference_sensor,
+                            'Paso3_Set': reference_set,
+                            'Paso3_Offset_K': path_info['offset_3'],
+                            'Paso3_Error_K': path_info['error_3'],
+                            'Paso3_From': None,
+                            'Paso3_Offset_K': path_info['offset_3'],
+                            'Paso3_Error_K': path_info['error_3'],
+                            
+                            # Total
+                            'Total_Offset_K': total_offset,
+                            'Total_Error_K': total_error
+                        })
+                    continue
+                
+                # Sensores normales (no raised)
+                all_paths = self._explore_all_paths(
+                    sensor, set_id, set_raised, reference_sensor, reference_set
+                )
+                
+                if not all_paths:
+                    continue
+                
+                # Exportar cada camino individualmente
+                for path_idx, (total_offset, total_error, path_info) in enumerate(all_paths, 1):
+                    all_paths_records.append({
+                        'Sensor': sensor,
+                        'Set': set_id,
+                        'Round': 1,
+                        'Path_Number': path_idx,
+                        
+                        # Paso 1: sensor → raised_r1
+                        'Paso1_From': sensor,
+                        'Paso1_To': path_info['raised_r1'],
+                        'Paso1_Set': set_id,
+                        'Paso1_Offset_K': path_info['offset_1'],
+                        'Paso1_Error_K': path_info['error_1'],
+                        
+                        # Paso 2: raised_r1 → bridge_r2_r3
+                        'Paso2_From': path_info['raised_r1'],
+                        'Paso2_To': path_info['bridge_r2_r3'],
+                        'Paso2_Set': path_info['set_r2'],
+                        'Paso2_Offset_K': path_info['offset_2'],
+                        'Paso2_Error_K': path_info['error_2'],
+                        
+                        # Paso 3: bridge_r2_r3 → reference
+                        'Paso3_From': path_info['bridge_r2_r3'],
+                        'Paso3_To': reference_sensor,
+                        'Paso3_Set': reference_set,
+                        'Paso3_Offset_K': path_info['offset_3'],
+                        'Paso3_Error_K': path_info['error_3'],
+                        
+                        # Total
+                        'Total_Offset_K': total_offset,
+                        'Total_Error_K': total_error
+                    })
+        
+        df = pd.DataFrame(all_paths_records)
+        
+        if len(df) > 0:
+            # Ordenar por Sensor, Set, Path_Number
+            df = df.sort_values(['Sensor', 'Set', 'Path_Number']).reset_index(drop=True)
+            
+            print(f"\n✓ Total caminos exportados: {len(df)}")
+            print(f"✓ Total sensores únicos: {df['Sensor'].nunique()}")
+            print(f"✓ Caminos promedio por sensor: {len(df) / df['Sensor'].nunique():.1f}")
+        else:
+            print("\n⚠️ No se encontraron caminos para exportar")
+        
+        return df

@@ -57,8 +57,8 @@ class Run:
         run_opts = self.config.get('run_options', {}) #run options en config.yml / utils 
         self.max_nan_threshold = run_opts.get('max_nan_threshold', 40) #umbral de NaNs para canales defectuosos 
         temp_range = run_opts.get('valid_temp_range', {}) #rango de temperaturas válidas
-        self.temp_min = temp_range.get('min', 60) #60 grados por defecto por si no está en config.yml
-        self.temp_max = temp_range.get('max', 350) #temperatura máxima por defecto 
+        self.temp_min = temp_range.get('min', 70) #60 grados por defecto por si no está en config.yml
+        self.temp_max = temp_range.get('max', 80) #temperatura máxima por defecto 
         
         # Cargar automáticamente los datos al iniciar el objeto 
         self._load_and_process()
@@ -139,6 +139,7 @@ class Run:
         self.defective_channels = nan_counts[nan_counts > self.max_nan_threshold].index.tolist() #canales con más NaNs que el umbral
         if self.defective_channels: # Si hay canales defectuosos
             print(f"  Canales defectuosos: {self.defective_channels}")
+            temps[self.defective_channels] = np.nan # Marcar canales defectuosos como NaN 24/02
         
         self.temperature_data = temps
         print(f"  Datos cargados: {len(temps)} registros")

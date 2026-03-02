@@ -190,7 +190,7 @@ sensors:
       sensors: [55264, 55178, 55258, 55192, 55185, 55177, 55263, 55265, 55184, 55176,
         55262, 55193]
     30.0:
-      discarded: [55255, 55173, 54926]
+      discarded: [55255, 55173, 54926, 49316]
       raised: [55253, 55168]
       round: 1
       reference: [49317, 55174]
@@ -373,7 +373,7 @@ sensors:
         55056, 55061]
     57.0:
       discarded: []
-      raised: []
+      raised: [48747]
       round: 3
       reference: [48177, 48421]
       sensors: [48484, 48747, 48869, 48956, 49112, 49167, 55233, 55073, 55253, 55227,
@@ -416,8 +416,8 @@ sensors:
 run_options:
   max_nan_threshold: 40
   valid_temp_range:
-    min: 60
-    max: 350
+    min: 71
+    max: 80
   default_ref_channel: 2
 output:
   save_calibration_excel: true
